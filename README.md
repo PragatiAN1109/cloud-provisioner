@@ -20,8 +20,11 @@ Automated tests can be added later once the project is more complete.
   create, list, retrieve, and delete environments over HTTP.
 * **Task 5** — a `Provisioner` interface and a `MockProvisioner` that
   simulates infrastructure provisioning (waiting, logging, occasional
-  temporary failures, context cancellation). Not yet connected to the
-  REST API or any worker — see below.
+  temporary failures, context cancellation).
+* **Task 6** — a job queue and worker pool that process CREATE/DELETE
+  jobs in the background, moving environments through
+  `PENDING → PROVISIONING → READY/FAILED` using the store and
+  provisioner. Not yet connected to the REST API — see below.
 
 ## Requirements
 
@@ -58,8 +61,10 @@ cloud-provisioner/
 │   │   └── main.go                # temporary manual validation runner
 │   ├── store-demo/
 │   │   └── main.go                # temporary manual store demo
-│   └── provisioner-demo/
-│       └── main.go                # temporary manual provisioner demo
+│   ├── provisioner-demo/
+│   │   └── main.go                # temporary manual provisioner demo
+│   └── worker-demo/
+│       └── main.go                # temporary manual worker-pool demo
 ├── internal/
 │   ├── api/
 │   │   ├── handler.go             # /health handler
@@ -69,9 +74,12 @@ cloud-provisioner/
 │   │   └── environment.go         # environment models and validation
 │   ├── store/
 │   │   └── memory_store.go        # thread-safe in-memory environment store
-│   └── provisioner/
-│       ├── provisioner.go         # Provisioner interface + TemporaryError
-│       └── mock_provisioner.go    # MockProvisioner simulation
+│   ├── provisioner/
+│   │   ├── provisioner.go         # Provisioner interface + TemporaryError
+│   │   └── mock_provisioner.go    # MockProvisioner simulation
+│   └── worker/
+│       ├── job.go                 # JobType, Job
+│       └── pool.go                # WorkerPool: queue + worker goroutines
 ├── go.mod                         # Go module definition
 ├── README.md
 └── .gitignore
@@ -109,8 +117,9 @@ curl -i -X POST http://localhost:8081/environments \
 Success: `202 Accepted`, returning the created environment (including
 its generated `id` and `PENDING` status). `202` rather than `201`
 because this project models asynchronous provisioning — the record is
-saved, but no actual provisioning work happens yet (see Task 5 below —
-even the provisioner itself isn't wired into this endpoint yet).
+saved, but no actual provisioning work happens yet. Even though a
+`Provisioner` (Task 5) and a worker pool (Task 6) now both exist, this
+endpoint is still not wired up to either of them — see Task 6 below.
 
 Errors:
 * `400 Bad Request` — invalid/malformed JSON, or a failed validation
@@ -224,6 +233,49 @@ Error: `404 Not Found` if the ID doesn't exist.
   /environments` still only validates and stores an environment with
   `PENDING` status — no worker exists yet to call `Provisioner.Create`.
 
+## Task 6: Job queue and worker pool
+
+* **`Job`** (`internal/worker/job.go`) — a small struct: a `JobType`
+  (`CREATE` or `DELETE`) plus an `EnvironmentID`. It deliberately holds
+  only the ID, not a full `Environment` snapshot, so the worker always
+  fetches the current state rather than acting on possibly-stale data.
+* **`WorkerPool`** (`internal/worker/pool.go`) — owns a **buffered
+  channel** (`chan Job`, capacity ~10) and starts **three worker
+  goroutines**, each looping forever: wait for a job or a cancellation
+  signal, process one job, repeat. Three workers let jobs run in
+  parallel rather than one at a time.
+* Each worker uses the existing `store.Store` and `provisioner.Provisioner`
+  interfaces — never a concrete `MemoryStore`/`MockProvisioner` directly,
+  and never the store's internal map.
+* **CREATE job flow**: `PENDING` (or a manually retried `FAILED`) →
+  `PROVISIONING` → `Provisioner.Create` is called → `READY` on success,
+  `FAILED` (with the error message) on failure.
+* **DELETE job flow**: any non-`DELETED` status → `DELETING` →
+  `Provisioner.Delete` is called → `DELETED` on success, `FAILED` on
+  failure. The record is kept in the store either way — the worker
+  never removes it, so the transition can still be observed afterward.
+* Jobs already `PROVISIONING`, `READY`, `DELETING`, or `DELETED` are
+  skipped (logged, not retried) for a CREATE job; `DELETED` is skipped
+  for a DELETE job.
+* **No retries yet** — a temporary provisioner failure still ends in
+  `FAILED`; retrying automatically is Task 8's job.
+* **Not yet connected to the REST API** — `POST /environments` and
+  `DELETE /environments/{id}` behave exactly as they did after Task 4;
+  nothing currently submits a job to this pool automatically.
+
+```
+CREATE:
+PENDING → PROVISIONING → READY
+                         or
+                       FAILED
+
+DELETE:
+READY → DELETING → DELETED
+                    or
+                  FAILED
+```
+
+
 ## Manual Testing
 
 This project currently uses manual testing instead of automated tests.
@@ -315,3 +367,46 @@ pool exists yet**, and **the provisioner is not connected to the REST
 API** — `POST /environments` still only validates and stores an
 environment with `PENDING` status; nothing currently calls
 `Provisioner.Create` or `Provisioner.Delete` automatically.
+
+### Manual Task 6 test (job queue and worker pool)
+
+```bash
+cd /Users/pragatinarote/Desktop/cloud-provisioner
+go run ./cmd/worker-demo
+```
+
+Runs ten scenarios against the real `WorkerPool`:
+
+1. **Start three workers** — logs `worker started` three times (order
+   not guaranteed — goroutine scheduling isn't deterministic).
+2. **Successful CREATE** — an environment moves `PENDING → PROVISIONING
+   → READY`; final status polled and printed.
+3. **Failed CREATE** — a provisioner with failure rate `1.0` drives an
+   environment to `FAILED`, with the temporary-error message printed.
+4. **Concurrent jobs** — three environments submitted together; all
+   three reach `READY`, with interleaved logs from different
+   `worker_id`s proving they ran in parallel.
+5. **Missing environment** — a job for a nonexistent ID logs a
+   not-found error; the worker stays alive and a subsequent valid job
+   still succeeds.
+6. **Unsupported job type** — `Submit` rejects it immediately:
+   `ERROR: unsupported job type: UPDATE`.
+7. **Empty environment ID** — `Submit` rejects it immediately:
+   `ERROR: environment ID is required`.
+8. **DELETE job** — an environment moves `READY → DELETING → DELETED`;
+   the record is confirmed still present in the store afterward (this
+   worker-driven delete differs from Task 4's HTTP `DELETE`, which
+   still removes the record immediately until Task 7 connects them).
+9. **Cancellation during active work** — the pool's context is
+   cancelled mid-provisioning; the environment ends at `FAILED` with
+   `context canceled`, and all workers exit cleanly (`Wait()` returns).
+10. **Queue full** — a dedicated pool with queue capacity `1` and no
+    running workers; the second submission returns
+    `ERROR: job queue is full`.
+
+No automated tests are included. No retries exist yet — a failed job
+stays `FAILED` until manually resubmitted. The worker pool is **not**
+connected to the REST API — `POST /environments` still only stores a
+`PENDING` environment, and `DELETE /environments/{id}` still removes
+records immediately, exactly as after Task 4. No real infrastructure is
+created anywhere in this project.

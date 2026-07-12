@@ -17,9 +17,11 @@ Automated tests can be added later once the project is more complete.
 * **Task 3** — a thread-safe, in-memory store that can create, read,
   update, and delete `Environment` records.
 * **Task 4** — a REST API, connected to the store, that lets a client
-  create, list, retrieve, and delete environments over HTTP. No
-  automated tests are included; no real cloud infrastructure is
-  created — everything lives in the server's own memory.
+  create, list, retrieve, and delete environments over HTTP.
+* **Task 5** — a `Provisioner` interface and a `MockProvisioner` that
+  simulates infrastructure provisioning (waiting, logging, occasional
+  temporary failures, context cancellation). Not yet connected to the
+  REST API or any worker — see below.
 
 ## Requirements
 
@@ -51,21 +53,26 @@ starting server on port 8081
 cloud-provisioner/
 ├── cmd/
 │   ├── server/
-│   │   └── main.go               # starts the HTTP server, wires store + handler
+│   │   └── main.go                # starts the HTTP server, wires store + handler
 │   ├── validate/
-│   │   └── main.go               # temporary manual validation runner
-│   └── store-demo/
-│       └── main.go               # temporary manual store demo
+│   │   └── main.go                # temporary manual validation runner
+│   ├── store-demo/
+│   │   └── main.go                # temporary manual store demo
+│   └── provisioner-demo/
+│       └── main.go                # temporary manual provisioner demo
 ├── internal/
 │   ├── api/
-│   │   ├── handler.go            # /health handler
+│   │   ├── handler.go             # /health handler
 │   │   ├── environment_handler.go # environment REST endpoints
-│   │   └── response.go           # writeJSON / writeError helpers
+│   │   └── response.go            # writeJSON / writeError helpers
 │   ├── model/
-│   │   └── environment.go        # environment models and validation
-│   └── store/
-│       └── memory_store.go       # thread-safe in-memory environment store
-├── go.mod                        # Go module definition
+│   │   └── environment.go         # environment models and validation
+│   ├── store/
+│   │   └── memory_store.go        # thread-safe in-memory environment store
+│   └── provisioner/
+│       ├── provisioner.go         # Provisioner interface + TemporaryError
+│       └── mock_provisioner.go    # MockProvisioner simulation
+├── go.mod                         # Go module definition
 ├── README.md
 └── .gitignore
 ```
@@ -102,8 +109,8 @@ curl -i -X POST http://localhost:8081/environments \
 Success: `202 Accepted`, returning the created environment (including
 its generated `id` and `PENDING` status). `202` rather than `201`
 because this project models asynchronous provisioning — the record is
-saved, but no actual provisioning work happens yet (no worker exists so
-far).
+saved, but no actual provisioning work happens yet (see Task 5 below —
+even the provisioner itself isn't wired into this endpoint yet).
 
 Errors:
 * `400 Bad Request` — invalid/malformed JSON, or a failed validation
@@ -189,6 +196,34 @@ Error: `404 Not Found` if the ID doesn't exist.
   resources become `404`, ID collisions become `409`, unexpected
   failures become `500` (without leaking internal details).
 
+## Task 5: Mock infrastructure provisioner
+
+* **`Provisioner` interface** (`internal/provisioner/provisioner.go`) —
+  describes what any real infrastructure provisioner must do:
+  `Create(ctx, env) error` and `Delete(ctx, env) error`. Nothing about
+  *how* provisioning happens is specified here — that's left to whatever
+  concrete type implements it.
+* **`MockProvisioner`** (`internal/provisioner/mock_provisioner.go`) — a
+  fake implementation that simulates provisioning without touching any
+  real infrastructure:
+  * logs the start, each service being "provisioned" or "deleted", and
+    the outcome;
+  * waits briefly per service (configurable delay);
+  * can be configured to sometimes return a `TemporaryError` (a
+    retryable, transient-style failure) based on a configured failure
+    rate between `0.0` (never fail) and `1.0` (always fail);
+  * respects context cancellation and deadlines, stopping immediately
+    instead of finishing all services;
+  * deletes services in reverse order, mirroring how real
+    infrastructure teardown commonly works.
+* This does **not** create any real AWS, Terraform, Kubernetes,
+  database, queue, cache, or storage resources — it is purely a
+  simulation, used to build and test the shape of provisioning logic
+  before wiring it into anything real.
+* The provisioner is **not yet connected** to the REST API. `POST
+  /environments` still only validates and stores an environment with
+  `PENDING` status — no worker exists yet to call `Provisioner.Create`.
+
 ## Manual Testing
 
 This project currently uses manual testing instead of automated tests.
@@ -209,20 +244,8 @@ Terminal 2:
 curl -i http://localhost:8081/health
 ```
 
-Expected result:
-
-```
-HTTP/1.1 200 OK
-Content-Type: application/json
-```
-
-and a body similar to:
-
-```json
-{"status":"ok"}
-```
-
-To stop the server, go back to Terminal 1 and press `Control + C`.
+Expected: `HTTP/1.1 200 OK`, `Content-Type: application/json`, body
+`{"status":"ok"}`. Stop the server with `Control + C`.
 
 ### Manual Task 2 test (validation logic)
 
@@ -231,8 +254,8 @@ cd /Users/pragatinarote/Desktop/cloud-provisioner
 go run ./cmd/validate
 ```
 
-This runs several valid and invalid `CreateEnvironmentRequest` values
-through the real validation logic and prints the result of each one.
+Runs several valid and invalid `CreateEnvironmentRequest` values through
+the real validation logic and prints the result of each one.
 
 ### Manual Task 3 test (in-memory store)
 
@@ -241,8 +264,8 @@ cd /Users/pragatinarote/Desktop/cloud-provisioner
 go run ./cmd/store-demo
 ```
 
-This runs the real `MemoryStore` implementation through 12 scenarios,
-including proof that returned data is safely copied.
+Runs the real `MemoryStore` through 12 scenarios, including proof that
+returned data is safely copied.
 
 ### Manual Task 4 test (REST API)
 
@@ -253,85 +276,42 @@ cd /Users/pragatinarote/Desktop/cloud-provisioner
 go run ./cmd/server
 ```
 
-Terminal 2 — run these in order:
+Terminal 2 — create, list, get, delete, and check all validation error
+cases (`name`/`region`/`services` missing, unsupported/duplicate
+service, malformed/empty JSON). See earlier project history or the
+`internal/api/environment_handler.go` comments for the exact `curl`
+commands and expected responses. Restarting the server (`Control + C`
+then `go run ./cmd/server` again) resets all data back to `[]`, since
+everything lives only in that process's memory.
+
+### Manual Task 5 test (mock provisioner)
 
 ```bash
-# 1. Health check
-curl -i http://localhost:8081/health
-
-# 2. List before creating anything -> expect []
-curl -i http://localhost:8081/environments
-
-# 3. Create a valid environment -> expect 202 Accepted
-curl -i -X POST http://localhost:8081/environments \
-  -H "Content-Type: application/json" \
-  -d '{"name": "payments-dev", "region": "us-west-2", "services": ["database", "queue"]}'
+cd /Users/pragatinarote/Desktop/cloud-provisioner
+go run ./cmd/provisioner-demo
 ```
 
-Copy the `"id"` value from the response (e.g. `env-a3f91c20`) — you'll
-need it for the next commands. To make this easier, save it in a shell
-variable:
+Runs six scenarios against the real `MockProvisioner`:
 
-```bash
-ENV_ID=env-REPLACE_WITH_YOUR_GENERATED_ID
-```
+1. **Successful Create** — failure rate `0.0`; logs each service, waits
+   briefly, then prints `SUCCESS: environment provisioning simulation completed`.
+2. **Successful Delete** — same provisioner; deletes services in
+   reverse order, then prints `SUCCESS: environment deletion simulation completed`.
+3. **Forced temporary failure** — failure rate `1.0`; after simulating
+   both services, returns a `TemporaryError` and prints
+   `EXPECTED TEMPORARY ERROR: ...` plus `Is temporary: true`.
+4. **Manual cancellation** — starts `Create` in a goroutine, cancels the
+   context partway through, and prints
+   `EXPECTED CANCELLATION: context canceled`.
+5. **Deadline timeout** — uses a context that times out before
+   provisioning would finish, printing
+   `EXPECTED DEADLINE: context deadline exceeded`.
+6. **Empty services** — calling `Create` with no services prints
+   `EXPECTED ERROR: environment has no services to provision`.
 
-```bash
-# 4. List again -> should now include the environment above
-curl -i http://localhost:8081/environments
-
-# 5. Get it directly by ID
-curl -i http://localhost:8081/environments/$ENV_ID
-
-# 6. Get a missing ID -> expect 404
-curl -i http://localhost:8081/environments/env-does-not-exist
-```
-
-```bash
-# 7-11. Validation failures -> each expects 400 Bad Request
-curl -i -X POST http://localhost:8081/environments -H "Content-Type: application/json" \
-  -d '{"name": "", "region": "us-west-2", "services": ["database"]}'          # name is required
-
-curl -i -X POST http://localhost:8081/environments -H "Content-Type: application/json" \
-  -d '{"name": "payments-dev", "region": "", "services": ["database"]}'      # region is required
-
-curl -i -X POST http://localhost:8081/environments -H "Content-Type: application/json" \
-  -d '{"name": "payments-dev", "region": "us-west-2", "services": []}'       # at least one service is required
-
-curl -i -X POST http://localhost:8081/environments -H "Content-Type: application/json" \
-  -d '{"name": "payments-dev", "region": "us-west-2", "services": ["database", "kafka"]}'    # unsupported service: kafka
-
-curl -i -X POST http://localhost:8081/environments -H "Content-Type: application/json" \
-  -d '{"name": "payments-dev", "region": "us-west-2", "services": ["database", "database"]}' # duplicate service: database
-
-# 12-13. Malformed / empty JSON -> each expects 400 Bad Request
-curl -i -X POST http://localhost:8081/environments -H "Content-Type: application/json" \
-  -d '{"name": "payments-dev",}'
-
-curl -i -X POST http://localhost:8081/environments -H "Content-Type: application/json"
-```
-
-```bash
-# 14. Delete the environment created earlier -> expect 204 No Content
-curl -i -X DELETE http://localhost:8081/environments/$ENV_ID
-
-# 15. Get it again -> expect 404
-curl -i http://localhost:8081/environments/$ENV_ID
-
-# 16. Delete a missing ID -> expect 404
-curl -i -X DELETE http://localhost:8081/environments/env-does-not-exist
-
-# 17. List after deletion -> expect []
-curl -i http://localhost:8081/environments
-```
-
-**Manual Test 18 — confirm in-memory behavior**: create one more
-environment, confirm it shows up in `GET /environments`, then stop the
-server with `Control + C` in Terminal 1, and start it again with
-`go run ./cmd/server`. Run `GET /environments` once more — it will
-return `[]` again, because all data lived only in that server
-process's memory and disappeared the moment the process stopped.
-
-No automated tests are included because this is currently a short
-learning project — testing here is entirely manual, using the commands
-above, and can be revisited later once the project has grown further.
+No automated tests are included — this is still a short learning
+project, and testing here is entirely manual. Also note: **no worker
+pool exists yet**, and **the provisioner is not connected to the REST
+API** — `POST /environments` still only validates and stores an
+environment with `PENDING` status; nothing currently calls
+`Provisioner.Create` or `Provisioner.Delete` automatically.

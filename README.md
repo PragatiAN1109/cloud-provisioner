@@ -13,10 +13,13 @@ Automated tests can be added later once the project is more complete.
 
 * **Task 1** — a basic HTTP server with a `/health` endpoint.
 * **Task 2** — domain models (`Environment`, `CreateEnvironmentRequest`)
-  and request validation, not yet wired up to an HTTP endpoint.
+  and request validation.
 * **Task 3** — a thread-safe, in-memory store that can create, read,
-  update, and delete `Environment` records, not yet wired up to an
-  HTTP endpoint either.
+  update, and delete `Environment` records.
+* **Task 4** — a REST API, connected to the store, that lets a client
+  create, list, retrieve, and delete environments over HTTP. No
+  automated tests are included; no real cloud infrastructure is
+  created — everything lives in the server's own memory.
 
 ## Requirements
 
@@ -48,22 +51,103 @@ starting server on port 8081
 cloud-provisioner/
 ├── cmd/
 │   ├── server/
-│   │   └── main.go          # starts the HTTP server
+│   │   └── main.go               # starts the HTTP server, wires store + handler
 │   ├── validate/
-│   │   └── main.go          # temporary manual validation runner
+│   │   └── main.go               # temporary manual validation runner
 │   └── store-demo/
-│       └── main.go          # temporary manual store demo
+│       └── main.go               # temporary manual store demo
 ├── internal/
 │   ├── api/
-│   │   └── handler.go       # /health handler logic
+│   │   ├── handler.go            # /health handler
+│   │   ├── environment_handler.go # environment REST endpoints
+│   │   └── response.go           # writeJSON / writeError helpers
 │   ├── model/
-│   │   └── environment.go   # environment models and validation
+│   │   └── environment.go        # environment models and validation
 │   └── store/
-│       └── memory_store.go  # thread-safe in-memory environment store
-├── go.mod                   # Go module definition
+│       └── memory_store.go       # thread-safe in-memory environment store
+├── go.mod                        # Go module definition
 ├── README.md
 └── .gitignore
 ```
+
+## Available endpoints
+
+### `GET /health`
+
+Health check. No body required.
+
+```bash
+curl -i http://localhost:8081/health
+```
+
+Success: `200 OK`, `{"status":"ok"}`.
+
+### `POST /environments`
+
+Creates a new environment. The server generates the ID and sets the
+initial status to `PENDING` — the client cannot set either.
+
+Request body:
+
+```json
+{"name": "payments-dev", "region": "us-west-2", "services": ["database", "queue"]}
+```
+
+```bash
+curl -i -X POST http://localhost:8081/environments \
+  -H "Content-Type: application/json" \
+  -d '{"name": "payments-dev", "region": "us-west-2", "services": ["database", "queue"]}'
+```
+
+Success: `202 Accepted`, returning the created environment (including
+its generated `id` and `PENDING` status). `202` rather than `201`
+because this project models asynchronous provisioning — the record is
+saved, but no actual provisioning work happens yet (no worker exists so
+far).
+
+Errors:
+* `400 Bad Request` — invalid/malformed JSON, or a failed validation
+  rule (`name is required`, `region is required`, `at least one
+  service is required`, `unsupported service: <name>`, `duplicate
+  service: <name>`, `service name cannot be empty`).
+* `409 Conflict` — the generated ID already existed (extremely rare).
+* `500 Internal Server Error` — an unexpected internal failure.
+
+### `GET /environments`
+
+Lists every stored environment.
+
+```bash
+curl -i http://localhost:8081/environments
+```
+
+Success: `200 OK`. Returns `[]` (not `null`) when nothing is stored yet.
+List order is not guaranteed, since the store is backed by a Go map.
+
+### `GET /environments/{id}`
+
+Retrieves one environment by ID.
+
+```bash
+curl -i http://localhost:8081/environments/env-a3f91c20
+```
+
+Success: `200 OK`, the matching environment.
+Error: `404 Not Found` — `{"error": "environment not found: env-a3f91c20"}`.
+
+### `DELETE /environments/{id}`
+
+Removes one environment immediately from the in-memory store. This is a
+real, immediate delete for this learning stage — a production platform
+would more likely mark the record `DELETING`, tear down real resources
+asynchronously, and only then mark it `DELETED`.
+
+```bash
+curl -i -X DELETE http://localhost:8081/environments/env-a3f91c20
+```
+
+Success: `204 No Content` (no response body).
+Error: `404 Not Found` if the ID doesn't exist.
 
 ## Task 3 concepts
 
@@ -76,14 +160,34 @@ cloud-provisioner/
 * **Constructors** — `NewMemoryStore()` builds a store with its map
   already initialized, so it's safe to use immediately.
 * **Mutexes / read & write locks** — a `sync.RWMutex` protects the map
-  so multiple goroutines (like concurrent HTTP requests, later) can
-  read at the same time, but writes get exclusive access.
+  so multiple goroutines (like concurrent HTTP requests) can read at
+  the same time, but writes get exclusive access.
 * **CRUD** — Create, Read (`Get`/`List`), Update, Delete: the standard
   four operations most backend storage exposes.
 * **Temporary data** — because everything lives in memory, all stored
   environments disappear the moment the program stops. That's an
   accepted tradeoff for this learning stage; a real system would use a
   database for durability.
+
+## Task 4 concepts
+
+* **REST API** — HTTP endpoints where the URL identifies a *resource*
+  (an environment) and the HTTP method identifies the *action*
+  (create/read/delete).
+* **Method-specific routing** — `mux.HandleFunc("POST /environments", ...)`
+  uses Go 1.22+'s built-in routing patterns; no third-party router.
+* **Dependency injection** — the HTTP handler is built with
+  `api.NewHandler(environmentStore)`, receiving the store instance
+  rather than constructing its own, so every request shares one store.
+* **Server-generated IDs** — the client never supplies an ID; the
+  server generates a random `env-xxxxxxxx` ID using `crypto/rand`.
+* **Server-managed fields** — `status`, `created_at`, and `updated_at`
+  are always set by the server, never by the client.
+* **Consistent JSON error format** — every error response looks like
+  `{"error": "message"}`.
+* **Status code mapping** — validation failures become `400`, missing
+  resources become `404`, ID collisions become `409`, unexpected
+  failures become `500` (without leaking internal details).
 
 ## Manual Testing
 
@@ -128,16 +232,7 @@ go run ./cmd/validate
 ```
 
 This runs several valid and invalid `CreateEnvironmentRequest` values
-through the real validation logic in `internal/model/environment.go` and
-prints the result of each one. Expected output for each case:
-
-* **Valid request** → `VALID`
-* **Missing name** → `INVALID: name is required`
-* **Missing region** → `INVALID: region is required`
-* **No services** → `INVALID: at least one service is required`
-* **Unsupported service** (`kafka`) → `INVALID: unsupported service: kafka`
-* **Duplicate service** (`database`, `database`) → `INVALID: duplicate service: database`
-* **Blank service** (spaces only) → `INVALID: service name cannot be empty`
+through the real validation logic and prints the result of each one.
 
 ### Manual Task 3 test (in-memory store)
 
@@ -146,29 +241,97 @@ cd /Users/pragatinarote/Desktop/cloud-provisioner
 go run ./cmd/store-demo
 ```
 
-This runs the real `MemoryStore` implementation from
-`internal/store/memory_store.go` through 12 scenarios and prints the
-result of each one. Key expected results:
+This runs the real `MemoryStore` implementation through 12 scenarios,
+including proof that returned data is safely copied.
 
-* An empty store reports `Environment count: 0`.
-* The first environment (`env-001`, `payments-dev`) and second
-  environment (`env-002`, `analytics-dev`) can both be created
-  successfully.
-* Creating `env-001` a second time is rejected with
-  `ERROR: environment already exists: env-001`.
-* `env-001` can be retrieved, showing its ID, name, region, services,
-  and status.
-* After creating both environments, `List()` reports
-  `Environment count: 2` (note: the printed order between env-001 and
-  env-002 may vary, since Go map iteration order is not guaranteed).
-* `env-001`'s status can be updated from `PENDING` to `READY`.
-* Retrieving or updating a missing ID (`env-999`) returns
-  `ERROR: environment not found: env-999`.
-* Deleting `env-002` succeeds, and the count drops to `1`; deleting
-  `env-999` again returns a not-found error.
-* Modifying the `Services` slice on a value returned by `Get` does
-  **not** change the stored data — a second `Get` still shows
-  `Stored services remain unchanged: [database queue]`.
+### Manual Task 4 test (REST API)
 
-Automated tests can be added back later once the project has grown
-past this early learning stage.
+Terminal 1:
+
+```bash
+cd /Users/pragatinarote/Desktop/cloud-provisioner
+go run ./cmd/server
+```
+
+Terminal 2 — run these in order:
+
+```bash
+# 1. Health check
+curl -i http://localhost:8081/health
+
+# 2. List before creating anything -> expect []
+curl -i http://localhost:8081/environments
+
+# 3. Create a valid environment -> expect 202 Accepted
+curl -i -X POST http://localhost:8081/environments \
+  -H "Content-Type: application/json" \
+  -d '{"name": "payments-dev", "region": "us-west-2", "services": ["database", "queue"]}'
+```
+
+Copy the `"id"` value from the response (e.g. `env-a3f91c20`) — you'll
+need it for the next commands. To make this easier, save it in a shell
+variable:
+
+```bash
+ENV_ID=env-REPLACE_WITH_YOUR_GENERATED_ID
+```
+
+```bash
+# 4. List again -> should now include the environment above
+curl -i http://localhost:8081/environments
+
+# 5. Get it directly by ID
+curl -i http://localhost:8081/environments/$ENV_ID
+
+# 6. Get a missing ID -> expect 404
+curl -i http://localhost:8081/environments/env-does-not-exist
+```
+
+```bash
+# 7-11. Validation failures -> each expects 400 Bad Request
+curl -i -X POST http://localhost:8081/environments -H "Content-Type: application/json" \
+  -d '{"name": "", "region": "us-west-2", "services": ["database"]}'          # name is required
+
+curl -i -X POST http://localhost:8081/environments -H "Content-Type: application/json" \
+  -d '{"name": "payments-dev", "region": "", "services": ["database"]}'      # region is required
+
+curl -i -X POST http://localhost:8081/environments -H "Content-Type: application/json" \
+  -d '{"name": "payments-dev", "region": "us-west-2", "services": []}'       # at least one service is required
+
+curl -i -X POST http://localhost:8081/environments -H "Content-Type: application/json" \
+  -d '{"name": "payments-dev", "region": "us-west-2", "services": ["database", "kafka"]}'    # unsupported service: kafka
+
+curl -i -X POST http://localhost:8081/environments -H "Content-Type: application/json" \
+  -d '{"name": "payments-dev", "region": "us-west-2", "services": ["database", "database"]}' # duplicate service: database
+
+# 12-13. Malformed / empty JSON -> each expects 400 Bad Request
+curl -i -X POST http://localhost:8081/environments -H "Content-Type: application/json" \
+  -d '{"name": "payments-dev",}'
+
+curl -i -X POST http://localhost:8081/environments -H "Content-Type: application/json"
+```
+
+```bash
+# 14. Delete the environment created earlier -> expect 204 No Content
+curl -i -X DELETE http://localhost:8081/environments/$ENV_ID
+
+# 15. Get it again -> expect 404
+curl -i http://localhost:8081/environments/$ENV_ID
+
+# 16. Delete a missing ID -> expect 404
+curl -i -X DELETE http://localhost:8081/environments/env-does-not-exist
+
+# 17. List after deletion -> expect []
+curl -i http://localhost:8081/environments
+```
+
+**Manual Test 18 — confirm in-memory behavior**: create one more
+environment, confirm it shows up in `GET /environments`, then stop the
+server with `Control + C` in Terminal 1, and start it again with
+`go run ./cmd/server`. Run `GET /environments` once more — it will
+return `[]` again, because all data lived only in that server
+process's memory and disappeared the moment the process stopped.
+
+No automated tests are included because this is currently a short
+learning project — testing here is entirely manual, using the commands
+above, and can be revisited later once the project has grown further.
